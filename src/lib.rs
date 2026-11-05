@@ -1,4 +1,10 @@
 pub mod util;
-
-mod side;
+pub mod side;
+pub mod order_book;
+pub mod discovery;
+pub mod websockets;
+pub mod writer;
+pub mod run;
+pub mod logger;
+pub mod metrics;
 pub use side::{InvalidSide, Side};
