@@ -15,6 +15,15 @@ pub struct OrderBook {
     pub initialized: bool,
 }
 
+pub fn assign_worker(token: &str, num_workers: usize) -> usize {
+    if num_workers == 0 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    (hasher.finish() as usize) % num_workers
+}
+
 
 impl OrderBook {
     pub fn new(symbol : String) -> Self {
@@ -22,11 +31,12 @@ impl OrderBook {
 
     }
 
-    pub fn apply_snapshot(&mut self,bids: Vec<(u64,u64)>,asks:Vec<(u64,u64)>,ex_ts: DateTime<Utc>) {
+    pub fn apply_snapshot(&mut self,bids: Vec<(u64,u64)>,asks:Vec<(u64,u64)>,ex_ts: DateTime<Utc>) -> bool {
 
+        // Reject stale snapshot 
         if let Some(curent_ts) = self.exchange_timestamp {
             if ex_ts < curent_ts {
-                return;
+                return false;
             }
         }
 
@@ -45,15 +55,19 @@ impl OrderBook {
         self.last_updated = Some(Utc::now());
         self.exchange_timestamp = Some(ex_ts);
         self.initialized = true;
+        true
     }
 
     pub fn apply_delta(&mut self,side : Side,price: u64,size:u64,ex_ts: DateTime<Utc>)->bool {
+        if !self.initialized {
+            return false;
+        }
 
-
-        self.initialized = true; 
-        // if !self.initialized {
-        //     return false;
-        // }
+        if let Some(last_ts) = self.exchange_timestamp {
+            if ex_ts < last_ts {
+                return false;
+            }
+        }
 
         let side = match side {
             Side::Buy => &mut self.bids,
@@ -128,8 +142,7 @@ impl OrderBookManager {
                         snap.bids.clone(),
                         snap.asks.clone(),
                         snap.exchange_timestamp,
-                    );
-                    true
+                    )
                 } else {
                     false
                 }
@@ -152,7 +165,7 @@ impl OrderBookManager {
 
     pub fn is_partition_ready(
         &self,
-        _worker_id: usize,
+        worker_id: usize,
         num_workers: usize,
         role: ConnectionRole,
     ) -> bool {
@@ -163,21 +176,21 @@ impl OrderBookManager {
             ConnectionRole::Primary => &self.primary_books,
             ConnectionRole::Secondary => &self.secondary_books,
         };
-        // let mut count = 0;
-        // let mut initialized_count = 0;
-        // for (token, book) in books {
-        //     let mut hasher = DefaultHasher::new();
-        //     token.hash(&mut hasher);
-        //     if (hasher.finish() as usize) % num_workers == worker_id {
-        //         count += 1;
-        //         if book.initialized {
-        //             initialized_count += 1;
-        //         }
-        //     }
-        // }
-        books.values().any(|b| b.initialized)
+        let mut count = 0;
+        let mut initialized_count = 0;
+        for (token, book) in books {
+
+            let worker = assign_worker(token, num_workers);
+            if worker == worker_id {
+                count += 1;
+                if book.initialized {
+                    initialized_count += 1;
+                }
+            }
+        }
+        // books.values().any(|b| b.initialized)
         
-        // count > 0 && count == initialized_count
+        count > 0 && count == initialized_count
     }
 
     pub fn generate_periodic_snapshots(&self, now: DateTime<Utc>,  num_workers: usize,active_roles: &[ConnectionRole]) -> Vec<SnapshotDomain> {
@@ -187,9 +200,8 @@ impl OrderBookManager {
         let mut snapshots = Vec::new();
        
         for token in self.primary_books.keys() {
-            let mut hasher = DefaultHasher::new();
-            token.hash(&mut hasher);
-            let worker_id = (hasher.finish() as usize) % num_workers;
+           
+            let worker_id = assign_worker(token, num_workers);
             let active_role = active_roles[worker_id];
             let authoritative_books = match active_role {
                 ConnectionRole::Primary => &self.primary_books,
@@ -210,7 +222,6 @@ impl OrderBookManager {
         new_role: ConnectionRole,
         now: DateTime<Utc>,
     ) -> Vec<SnapshotDomain> {
-        use std::hash::{DefaultHasher, Hash, Hasher};
         let books = match new_role {
             ConnectionRole::Primary => &self.primary_books,
             ConnectionRole::Secondary => &self.secondary_books,
@@ -218,9 +229,9 @@ impl OrderBookManager {
         books
             .iter()
             .filter_map(|(token, book)| {
-                let mut hasher = DefaultHasher::new();
-                token.hash(&mut hasher);
-                if (hasher.finish() as usize) % num_workers == worker_id {
+
+               let worker = assign_worker(token, num_workers);
+                if worker == worker_id {
                     book.to_sbe_snapshot(now)
                 } else {
                     None
