@@ -64,11 +64,13 @@ pub async fn run(
                 let applied = order_book_manager.apply_event(role, &event);
 
                 if let MarketEvent::Delta(ref delta) = event {
-                    let latency_us = (received_at - delta.exchange_timestamp)
-                        .num_microseconds()
-                        .max(Some(0))
-                        .unwrap_or(0) as u64;
-                    metrics.record_feed_latency(worker_id, role, latency_us);
+                    if let Some(latency_us) = received_at
+                    .signed_duration_since(delta.exchange_timestamp)
+                    .num_microseconds()
+                    .filter(|&lat| lat >= 0 && lat < 10_000_000) 
+                {
+                    metrics.record_feed_latency(worker_id, role, latency_us as u64);
+                }
                 }
 
 
@@ -86,7 +88,10 @@ pub async fn run(
                             side: delta.side,
                             symbol: delta.asset_id,
                         };
-                        let _ = writer_tx.send(WriterCommand::Delta(sbe_delta)).await;
+                        if let Err(e) = writer_tx.send(WriterCommand::Delta(sbe_delta)).await{
+                            error!("SBE Writer channel closed {}, Stopping collecter",e);
+                            return Err(anyhow::anyhow!("SBE Write unavailable").into());
+                        }
                     }
                 }
         }
@@ -114,16 +119,31 @@ pub async fn run(
                 if current_health != ConnectionHealth::Connected && candidate_health == ConnectionHealth::Connected {
                     trigger_switch = true;
                     switch_reason = "CONNECTION DISCONNECTED";
+                    selector.better_since = None;
                 }else if current_health == ConnectionHealth::Connected && candidate_health ==ConnectionHealth::Connected {
-                    if let (Some(active_p50), Some(cand_p50)) = (
-                        metrics.get_worker_median(w_id, current_role, 100),
-                        metrics.get_worker_median(w_id, candidate_role, 100),
-                    ) {
-                        if selector.latency_check(active_p50, cand_p50, now_instant) {
-                            trigger_switch = true;
-                            switch_reason = "1-HOUR LATENCY SUPERIORITY (>= 10% faster)";
+
+                    let candidate_ready = order_book_manager.is_partition_ready(w_id, num_workers, candidate_role);
+
+                    if candidate_ready  {
+                        if let (Some(active_p50), Some(cand_p50)) = (
+                            metrics.get_worker_median(w_id, current_role, 100),
+                            metrics.get_worker_median(w_id, candidate_role, 100),
+                        ) {
+                            if selector.latency_check(active_p50, cand_p50, now_instant) {
+                                trigger_switch = true;
+                                switch_reason = "1-HOUR LATENCY SUPERIORITY (>= 10% faster)";
+                            }
+                            else {
+                                selector.better_since = None;
+                            }
                         }
                     }
+                    else {
+                        selector.better_since = None;
+                    }
+                }
+                else {
+                    selector.better_since = None;
                 }
 
                     if trigger_switch {
@@ -131,9 +151,9 @@ pub async fn run(
                             selector.active_role = candidate_role;
                             metrics.total_switches.fetch_add(1, Ordering::Relaxed);
                             warn!(
-                                "[Worker {}] Active {:?} dropped ({:?})! Promoted {:?} (ready). Emitting handoff snapshots...",
-                                w_id, current_role, current_health, candidate_role
-                            );
+                                "[Worker {}] Switch triggered [{}]! Active {:?} ({:?}) -> Promoted {:?} (ready). Emitting handoff snapshots...",
+                                  w_id, switch_reason, current_role, current_health, candidate_role
+                              );
                             let handoff_snaps = order_book_manager.generate_handoff_snapshots(
                                 w_id,
                                 num_workers,
@@ -147,8 +167,8 @@ pub async fn run(
                             }
                         } else {
                             warn!(
-                                "[Worker {}] Candidate {:?} connected but books NOT ready yet. Waiting for initial snapshots...",
-                                w_id, candidate_role
+                                "[Worker {}] Switch condition met ({}) but candidate {:?} books NOT ready yet. Waiting for initial snapshots...",
+                                  w_id, switch_reason, candidate_role
                             );
                         }
 

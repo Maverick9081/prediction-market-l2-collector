@@ -19,6 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use crate::{Side, metrics::Metrics};
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+pub const LATENCY_SUPERIORITY_THRESHOLD_PCT: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
@@ -555,8 +556,8 @@ impl SourceSelector {
             return false;
         }
 
-        // 5% faster
-        if !(candidate_median.saturating_mul(100) <= active_median.saturating_mul(95)) {
+        // 10% faster
+        if !(candidate_median.saturating_mul(100) <= active_median.saturating_mul(100 -LATENCY_SUPERIORITY_THRESHOLD_PCT)) {
             self.better_since = None;
             return false;
         }

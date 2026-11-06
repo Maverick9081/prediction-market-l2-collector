@@ -26,18 +26,16 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
     let (writer_tx, writer_rx) = mpsc::channel::<WriterCommand>(10_000);
     let sbe_output_path = PathBuf::from("orderbook.sbe");
 
-    tokio::spawn(run_sbe_writer(sbe_output_path, writer_rx));
-
-
+    let writer_handle = tokio::spawn(run_sbe_writer(sbe_output_path, writer_rx));
 
     let (event_tx,event_rx) = channel::<WsEvent>(10000);
     let ws_pool = Pool::new(6, event_tx);
 
     let (diff_tx,diff_rx) = channel(100);
 
-    let client = Client::new();
+    let client = Client::builder().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(20)).build()?;
 
-    tokio::spawn(run_discovery(client, Duration::from_secs(60),diff_tx));
+    let discovery_handle = tokio::spawn(run_discovery(client, Duration::from_secs(60),diff_tx));
 
 
     let _ = run(diff_rx, ws_pool, writer_tx, event_rx).await;
