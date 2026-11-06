@@ -46,34 +46,40 @@ pub async fn fetch_active(client:&Client) -> Result<HashSet<String>,Error> {
 
     let mut active = HashSet::new();
     let mut cursor = String::new();
+    let mut seen_cursors:HashSet<String> = HashSet::new();
 
     loop {
-        let url = if cursor.is_empty() {
-            POLYMARKET_MARKETS_URL.to_string()
-        }else {
-            format!{"{}?next_cursor={}",POLYMARKET_MARKETS_URL,cursor}
-        };
-
-        let res = client.get(url).send().await?.error_for_status()?;
+       
+        let mut req = client.get(POLYMARKET_MARKETS_URL);
+        if !cursor.is_empty() {
+            req = req.query(&[("next_cursor", cursor.as_str())]);
+        }
+        let res = req.send().await?.error_for_status()?;
         let sampling: SamplingResponse = res.json().await?;
         for market in sampling.data {
             if market.active && !market.closed && market.accepting_orders {
                 for token in market.tokens {
-                    active.insert(token.token_id);
+                    if !token.token_id.trim().is_empty() {
+                        active.insert(token.token_id);
+                    }
                 }
             }
         }
 
         match sampling.next_cursor {
-            Some(ref c) if !c.is_empty() && c != "LTE=" && c != &cursor => {
-                cursor =c.clone();
+            Some(c) if !c.is_empty() && c != "LTE=" => {
+                if !seen_cursors.insert(c.clone()) {
+                    error!("Pagination cursor repeated: {}", c);
+                    break;
+                }
+        
+                cursor = c;
             }
             _ => break
         }
 
     }
 
-    // let markets:Vec<Market> = res.json().await?;
 
     Ok(active)
 }
