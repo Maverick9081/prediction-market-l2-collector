@@ -1,14 +1,13 @@
-use std::{collections::VecDeque, sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}, time::{Duration, Instant}};
+use std::{collections::VecDeque, sync::{Arc, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}}, time::{Duration, Instant}};
 
 use log::info;
 
 use crate::market_data::ConnectionRole;
 
-
-pub const ARRAY_SIZE :usize = 5000000;
-
 const LATENCY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_LATENCY_SAMPLES: usize = 50_000;
+
+const HISTOGRAM_BUCKETS:usize = 5000;
 
 #[derive(Default,Debug,Clone)]
 pub struct LatencyTracker {
@@ -77,8 +76,8 @@ pub struct Metrics {
     pub total_updates: Arc<AtomicUsize>,
     pub total_switches: Arc<AtomicUsize>,  
     pub total_recycles: Arc<AtomicUsize>, 
-    latencies : Arc<Mutex<Vec<u64>>>,
-    worker_latencies: Arc<Mutex<Vec<LatencyTracker>>>,
+    latencies : Arc<Vec<AtomicU64>>,
+    worker_latencies: Arc<Vec<Mutex<LatencyTracker>>>,
 }
 
 
@@ -86,8 +85,10 @@ impl Metrics{
     pub fn new(num_workers : usize) -> Self {
         let mut trackers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            trackers.push(LatencyTracker::new());
+            trackers.push(Mutex::new(LatencyTracker::new()));
         }
+
+        let histogram = (0..=HISTOGRAM_BUCKETS).map(|_| AtomicU64::new(0)).collect();
       Self{  
         current_subbed: Arc::new(AtomicUsize::new(0)),
         total_unsubbed: Arc::new(AtomicUsize::new(0)),
@@ -98,8 +99,8 @@ impl Metrics{
         total_updates: Arc::new(AtomicUsize::new(0)),
         total_switches: Arc::new(AtomicUsize::new(0)),
         total_recycles: Arc::new(AtomicUsize::new(0)),
-        latencies: Arc::new(Mutex::new(Vec::with_capacity(ARRAY_SIZE))),
-        worker_latencies: Arc::new(Mutex::new(trackers)),
+        latencies: Arc::new(histogram),
+        worker_latencies: Arc::new(trackers),
     }}
 
 
@@ -130,25 +131,23 @@ impl Metrics{
     pub fn record_latency(&self,latency_ms :u64) {
 
         self.total_updates.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut lock) = self.latencies.lock() {
-            if lock.len() < ARRAY_SIZE {
-                lock.push(latency_ms);
-            }
-        }
+        let bucket = (latency_ms as usize).min(HISTOGRAM_BUCKETS);
+        self.latencies[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_feed_latency(&self, worker_id: usize, role: ConnectionRole, latency_us: u64) {
-        if let Ok(mut trackers) = self.worker_latencies.lock() {
-            if let Some(tracker) = trackers.get_mut(worker_id) {
+        if let Some(tracker) = self.worker_latencies.get(worker_id) {
+            if let Ok(mut tracker) = tracker.lock() {
                 tracker.record(role, latency_us);
-            }
         }
+        }
+       
     }
 
     pub fn get_worker_median(&self, worker_id: usize, role: ConnectionRole, min_samples: usize) -> Option<u64> {
-        if let Ok(mut trackers) = self.worker_latencies.lock() {
-            if let Some(tracker) = trackers.get_mut(worker_id) {
-                return tracker.get_median(role, min_samples);
+        if let Some(tracker) = self.worker_latencies.get(worker_id) {
+            if let Ok(mut lock) = tracker.lock() {
+                return lock.get_median(role, min_samples);
             }
         }
         None
@@ -181,29 +180,56 @@ impl Metrics{
             self.total_switches.load(Ordering::Relaxed),
             self.total_recycles.load(Ordering::Relaxed),
         );
-        let mut samples = {
-            if let Ok(mut lock) = self.latencies.lock() {
-                std::mem::take(&mut *lock)
-            } else {
-                Vec::new()
+
+        let mut counts = Vec::with_capacity(HISTOGRAM_BUCKETS+1);
+        let mut sum_ms = 0u128;
+        let mut min_ms = None;
+        let mut max_ms = 0u64;
+        let mut total_samples = 0u64;
+
+        for (ms, bucket) in self.latencies.iter().enumerate(){
+            let count = bucket.swap(0, Ordering::Relaxed);
+            counts.push(count);
+
+
+            if count > 0 {
+                total_samples += count;
+                sum_ms += ms as u128 * count as u128;
+
+                min_ms.get_or_insert(ms as u64);
+                max_ms = ms as u64;
             }
-        };
-        if !samples.is_empty() {
-            samples.sort_unstable();
-            let count = samples.len();
-            let min_ms = samples[0];
-            let max_ms = samples[count - 1];
-           
-            let avg_ms = (samples.iter().map(|&s| s as u128).sum::<u128>() / count as u128) as u64;
-            let p50_ms = samples[count * 50 / 100];
-            let p95_ms = samples[count * 95 / 100];
-            let rate_per_sec = count / 60;
+        }
+
+        if total_samples > 0 {
+            let avg_ms = (sum_ms / total_samples as u128) as u64;
+            let rate_per_sec = total_samples/60;
+
+            let p50_target = (total_samples * 50).div_ceil(100);
+            let p95_target = (total_samples * 95).div_ceil(100);
+
+            let mut running = 0u64;
+             let mut p50_ms = 0;
+            let mut p95_ms = 0;
+
+            for (ms ,count) in counts.iter().enumerate() {
+
+                running += count;
+
+                if running >= p50_target && p50_ms == 0 {
+                    p50_ms = ms as u64;
+                }
+
+                if running >= p95_target {
+                    p95_ms = ms as u64;
+                    break;
+                }
+            }
+
             info!(
                 "Active Feed Latency ({} samples, ~{}/s): min: {}ms | avg: {}ms | p50: {}ms | p95: {}ms | max: {}ms",
-                count, rate_per_sec, min_ms, avg_ms, p50_ms, p95_ms, max_ms
+                total_samples, rate_per_sec, min_ms.unwrap_or(0), avg_ms, p50_ms, p95_ms, max_ms
             );
-        } else {
-            info!("Active Feed Latency: No price deltas recorded in this 60s window");
         }
         info!("========================================================");
     }
