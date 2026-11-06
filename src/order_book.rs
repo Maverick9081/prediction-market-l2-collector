@@ -43,13 +43,17 @@ impl OrderBook {
         self.bids.clear();
 
         for (price,size) in bids {
-            self.bids.insert(price,size);
+            if size > 0 {
+                self.bids.insert(price,size);
+            }
         }
 
         self.asks.clear();
 
         for (prize,size) in asks {
-            self.asks.insert(prize,size);
+            if size > 0 {
+                self.asks.insert(prize,size);
+            }
         }
 
         self.last_updated = Some(Utc::now());
@@ -197,7 +201,7 @@ impl OrderBookManager {
         if num_workers == 0 || active_roles.len() != num_workers {
             return Vec::new();
         }
-        let mut snapshots = Vec::new();
+        let mut snapshots = Vec::with_capacity(self.primary_books.len());
        
         for token in self.primary_books.keys() {
            
@@ -222,6 +226,11 @@ impl OrderBookManager {
         new_role: ConnectionRole,
         now: DateTime<Utc>,
     ) -> Vec<SnapshotDomain> {
+
+        if num_workers == 0 || worker_id >= num_workers {
+            return Vec::new();
+        }
+
         let books = match new_role {
             ConnectionRole::Primary => &self.primary_books,
             ConnectionRole::Secondary => &self.secondary_books,
