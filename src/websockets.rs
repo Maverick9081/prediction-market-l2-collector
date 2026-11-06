@@ -1,13 +1,10 @@
 use std::{
-    collections::HashSet, hash::{DefaultHasher, Hash, Hasher}, str::FromStr, sync::atomic::Ordering, time::{Duration},
+    collections::HashSet, hash::{DefaultHasher, Hash, Hasher}, sync::atomic::Ordering, time::{Duration},
 };
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use rust_decimal::Decimal;
-use serde::Deserialize;
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender, channel},
@@ -16,25 +13,8 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-use crate::{Side, metrics::Metrics};
+use crate::{ market_data::{ConnectionRole, MarketEvent}, metrics::Metrics, order_book::SourceSelector, polymarket::{POLYMARKET_WS_URL, parse_market_event}, traits::FeedPool};
 
-const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-pub const LATENCY_SUPERIORITY_THRESHOLD_PCT: u64 = 10;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionRole {
-    Primary,
-    Secondary,
-}
-
-impl ConnectionRole {
-    pub fn switch(&self) -> Self {
-        match self {
-            ConnectionRole::Primary => ConnectionRole::Secondary,
-            ConnectionRole::Secondary => ConnectionRole::Primary,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionHealth {
@@ -43,70 +23,6 @@ pub enum ConnectionHealth {
     Disconnected,
     Recycling,
 }
-
-#[derive(Debug, Clone)]
-pub enum MarketEvent {
-    Snapshot(BookSnapshot),
-    Delta(PriceDelta),
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(tag = "event_type")]
-enum RawWsMsg {
-    #[serde(rename = "book")]
-    Book {
-        asset_id: String,
-        bids: Vec<RawLevel>,
-        asks: Vec<RawLevel>,
-        #[serde(default)]
-        timestamp: Option<String>,
-    },
-    #[serde(rename = "price_change")]
-    PriceChange {
-        market: Option<String>,
-        price_changes: Vec<RawPriceChange>,
-        #[serde(default)]
-        timestamp: Option<String>,
-    },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Deserialize, Debug)]
-struct RawLevel {
-    price: String,
-    size: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct RawPriceChange {
-    asset_id: String,
-    price: String,
-    size: String,
-    side: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct BookSnapshot {
-    pub asset_id: String,
-    pub bids: Vec<(u64, u64)>,
-    pub asks: Vec<(u64, u64)>,
-    pub exchange_timestamp: DateTime<Utc>,
-}
-#[derive(Debug, Clone)]
-pub struct PriceDelta {
-    pub asset_id: String,
-    pub side: Side,
-    pub price: u64,
-    pub size: u64,
-    pub exchange_timestamp: DateTime<Utc>,
-}
-
-// #[derive(Debug, Clone)]
-// pub enum WsEvent {
-//     Snapshot(BookSnapshot),
-//     Delta(PriceDelta),
-// }
 
 #[derive(Debug, Clone)]
 pub struct WsEvent {
@@ -121,126 +37,6 @@ pub enum WorkerCommand {
     Shutdown,
 }
 
-fn parse_scaled(val: &str) -> Result<u64> {
-    let decimal = Decimal::from_str(val)?;
-
-    let scaled = decimal
-        .checked_mul(Decimal::from(1_000_000u64))
-        .ok_or_else(|| anyhow::anyhow!("Value overflow: {}", val))?;
-
-    let result: u64 = scaled
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid or out-of-range value: {}", val))?;
-
-    Ok(result)
-}
-
-fn parse_timestamp(ts: Option<&str>) -> Result<DateTime<Utc>> {
-    let raw = ts.ok_or_else(|| anyhow::anyhow!("Missing exchange timestamp"))?;
-    let millis: i64 = raw
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Malformed timestamp: {}", raw))?;
-    let dt = if millis > 1_000_000_000_000 {
-        DateTime::from_timestamp_millis(millis)
-    } else {
-        DateTime::from_timestamp(millis, 0)
-    };
-    dt.ok_or_else(|| anyhow::anyhow!("Out of bounds timestamp: {}", millis))
-}
-
-fn parse_market_event(worker_id: usize, role: ConnectionRole, text: &str) -> Vec<MarketEvent> {
-    let mut events = Vec::new();
-    if let Ok(raw) = serde_json::from_str::<RawWsMsg>(text) {
-        match raw {
-            RawWsMsg::Book {
-                asset_id,
-                bids,
-                asks,
-                timestamp,
-                ..
-            } => {
-                let ex_ts = match parse_timestamp(timestamp.as_deref()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(
-                            "[Worker {} - {:?}] Dropping snapshot {}: {}",
-                            worker_id, role, asset_id, e
-                        );
-                        return events;
-                    }
-                };
-
-                let mut parsed_bids = Vec::with_capacity(bids.len());
-                for l in bids {
-                    match (parse_scaled(&l.price), parse_scaled(&l.size)) {
-                        (Ok(p), Ok(s)) => parsed_bids.push((p, s)),
-                        (Err(e), _) | (_, Err(e)) => {
-                            warn!(
-                                "[Worker {} - {:?}] Rejecting incomplete snapshot for {}: invalid bid level: {}",
-                                worker_id, role, asset_id, e
-                            );
-                            return events;
-                        }
-                    }
-                }
-                let mut parsed_asks = Vec::with_capacity(asks.len());
-                for l in asks {
-                    match (parse_scaled(&l.price), parse_scaled(&l.size)) {
-                        (Ok(p), Ok(s)) => parsed_asks.push((p, s)),
-                        (Err(e), _) | (_, Err(e)) => {
-                            warn!(
-                                "[Worker {} - {:?}] Rejecting incomplete snapshot for {}: invalid ask level: {}",
-                                worker_id, role, asset_id, e
-                            );
-                            return events;
-                        }
-                    }
-                }
-                events.push(MarketEvent::Snapshot(BookSnapshot {
-                    asset_id,
-                    bids: parsed_bids,
-                    asks: parsed_asks,
-                    exchange_timestamp: ex_ts,
-                }));
-            }
-            RawWsMsg::PriceChange {
-                price_changes,
-                timestamp,
-                ..
-            } => {
-                let ex_ts = match parse_timestamp(timestamp.as_deref()) {
-                    Ok(t) => t,
-                    Err(_) => return events,
-                };
-                for pc in price_changes {
-                    let side = match pc.side.as_str() {
-                        "BUY" => Side::Buy,
-                        "SELL" => Side::Sell,
-                        unknown => {
-                            warn!(
-                                "[Worker {} - {:?}] Unknown side '{}' on token {}. Skipping delta.",
-                                worker_id, role, unknown, pc.asset_id
-                            );
-                            continue;
-                        }
-                    };
-                    if let (Ok(p), Ok(s)) = (parse_scaled(&pc.price), parse_scaled(&pc.size)) {
-                        events.push(MarketEvent::Delta(PriceDelta {
-                            asset_id: pc.asset_id,
-                            side,
-                            price: p,
-                            size: s,
-                            exchange_timestamp: ex_ts,
-                        }));
-                    }
-                }
-            }
-            RawWsMsg::Other => {}
-        }
-    }
-    events
-}
-
 pub async fn run_worker(
     worker_id: usize,
     role: ConnectionRole,
@@ -253,7 +49,7 @@ pub async fn run_worker(
     let mut assigned_tokens: HashSet<String> = HashSet::new();
     loop {
         let _ = health_tx.send(ConnectionHealth::Connecting);
-        let (ws_stream, _) = match connect_async(WS_URL).await {
+        let (ws_stream, _) = match connect_async(POLYMARKET_WS_URL).await {
             Ok(res) => res,
             Err(e) => {
                 error!("[Worker {}] Failed to connect: {}", worker_id, e);
@@ -514,58 +310,6 @@ impl FeedManager {
     }
 }
 
-pub struct SourceSelector {
-    pub worker_id: usize,
-    pub active_role: ConnectionRole,
-    pub primary_health: WatchReceiver<ConnectionHealth>,
-    pub secondary_health: WatchReceiver<ConnectionHealth>,
-    pub better_since : Option<Instant>
-}
-
-impl SourceSelector {
-    pub fn new(
-        worker_id: usize,
-        primary_health: WatchReceiver<ConnectionHealth>,
-        secondary_health: WatchReceiver<ConnectionHealth>,
-    ) -> Self {
-        Self {
-            worker_id,
-            active_role: ConnectionRole::Primary,
-            primary_health,
-            secondary_health,
-            better_since:None
-        }
-    }
-    pub fn check_failover(&mut self) -> Option<ConnectionRole> {
-        let p_ok = *self.primary_health.borrow() == ConnectionHealth::Connected;
-        let s_ok = *self.secondary_health.borrow() == ConnectionHealth::Connected;
-        if self.active_role == ConnectionRole::Primary && !p_ok && s_ok {
-            self.active_role = ConnectionRole::Secondary;
-            Some(ConnectionRole::Secondary)
-        } else if self.active_role == ConnectionRole::Secondary && !s_ok && p_ok {
-            self.active_role = ConnectionRole::Primary;
-            Some(ConnectionRole::Primary)
-        } else {
-            None
-        }
-    }
-
-    pub fn latency_check(&mut self,active_median:u64,candidate_median: u64,now :Instant) -> bool {
-        if active_median == 0 {
-            self.better_since = None;
-            return false;
-        }
-
-        // 10% faster
-        if !(candidate_median.saturating_mul(100) <= active_median.saturating_mul(100 -LATENCY_SUPERIORITY_THRESHOLD_PCT)) {
-            self.better_since = None;
-            return false;
-        }
-        let since = self.better_since.get_or_insert(now);
-        now.duration_since(*since) >= Duration::from_secs(60 * 60)
-    }
-}
-
 pub struct Pool {
     feed_managers: Vec<FeedManager>,
     worker_handles: Vec<JoinHandle<()>>,
@@ -575,6 +319,7 @@ pub struct Pool {
 impl Pool {
     pub fn new(workers: usize, event_tx: Sender<WsEvent>) -> Self {
         info!(
+            
             "Initializing WebSocket pool with {} workers for redunduncy ",
             workers * 2
         );
@@ -715,5 +460,27 @@ impl Pool {
         for handle in self.worker_handles {
             let _ = handle.await;
         }
+    }
+}
+
+
+impl FeedPool for Pool {
+    async  fn subscribe(&self,tokens : Vec<String>)  {
+        self.subscribe(tokens).await;
+    }
+    async fn unsubscribe(&self,tokens : Vec<String>) {
+        self.unsubscribe(tokens).await;
+    }
+
+    async fn shutdown(self) {
+        self.shutdown().await;
+    }
+
+    fn metrics(&self) -> Metrics {
+        self.metrics().clone()
+    }
+
+    fn create_source_selectors(&self) -> Vec<SourceSelector> {
+        self.create_source_selectors()
     }
 }

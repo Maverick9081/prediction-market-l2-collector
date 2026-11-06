@@ -12,16 +12,13 @@ use tokio::{
 };
 
 use crate::{
-    discovery::DiscoveryDiff,
-    order_book::OrderBookManager,
-    util::dtos::challenge_orderbook::PriceLevelUpdateDomain,
-    websockets::{ConnectionHealth, ConnectionRole, MarketEvent, Pool, WsEvent},
-    writer::WriterCommand,
+    discovery::DiscoveryDiff, market_data::{ConnectionRole, MarketEvent, QuantityUpdate}, order_book::OrderBookManager, traits::FeedPool, util::dtos::challenge_orderbook::PriceLevelUpdateDomain, websockets::{ConnectionHealth, Pool, WsEvent}, writer::WriterCommand,
 };
 
-pub async fn run(
+
+pub async fn run<P:FeedPool>(
     mut diff_rx: Receiver<DiscoveryDiff>,
-    ws_pool: Pool,
+    ws_pool: P,
     writer_tx: Sender<WriterCommand>,
     mut event_rx: Receiver<WsEvent>,
 ) -> Result<(), Box<dyn Error>> {
@@ -79,12 +76,16 @@ pub async fn run(
                         let now = Utc::now();
                         let latency = (now - delta.exchange_timestamp).num_milliseconds().max(0) as u64;
                         metrics.record_latency(latency);
+                        let size = match delta.size{
+                            QuantityUpdate::Set(s) => s as i64,
+                            QuantityUpdate::Change(c) => c as i64
+                        };
 
                         let sbe_delta = PriceLevelUpdateDomain {
                             backtest_timestamp: now,
                             exchange_timestamp: delta.exchange_timestamp,
                             price_level: delta.price as i64,
-                            quantity: delta.size as i64,
+                            quantity: size,
                             side: delta.side,
                             symbol: delta.asset_id,
                         };
@@ -203,7 +204,11 @@ pub async fn run(
                         let applied = order_book_manager.apply_event(role, &event);
                         if applied && role == source_selectors[worker_id].active_role {
                             if let MarketEvent::Delta(delta) = event {
-                                if let (Ok(p), Ok(s)) = (i64::try_from(delta.price), i64::try_from(delta.size)) {
+                                if let (Ok(p)) = (i64::try_from(delta.price)) {
+                                    let s = match delta.size {
+                                        QuantityUpdate::Set(s) => s as i64,
+                                        QuantityUpdate::Change(c) => c,
+                                    };                                
                                     let _ = writer_tx.send(WriterCommand::Delta(PriceLevelUpdateDomain {
                                         backtest_timestamp: Utc::now(),
                                         exchange_timestamp: delta.exchange_timestamp,

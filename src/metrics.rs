@@ -2,7 +2,8 @@ use std::{collections::VecDeque, sync::{Arc, Mutex, atomic::{AtomicUsize, Orderi
 
 use log::info;
 
-use crate::websockets::ConnectionRole;
+use crate::market_data::ConnectionRole;
+
 
 pub const ARRAY_SIZE :usize = 5000000;
 

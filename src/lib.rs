@@ -7,4 +7,7 @@ pub mod writer;
 pub mod run;
 pub mod logger;
 pub mod metrics;
+pub mod market_data;
+pub mod polymarket;
+pub mod traits;
 pub use side::{InvalidSide, Side};

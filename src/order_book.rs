@@ -1,10 +1,14 @@
-use std::{collections::{BTreeMap, HashMap}, hash::{DefaultHasher, Hash, Hasher}};
+use std::{collections::{BTreeMap, HashMap}, hash::{DefaultHasher, Hash, Hasher}, time::Duration};
 
 use chrono::{DateTime, Utc};
+use tokio::time::Instant;
+use tokio::sync::watch::{ Receiver as WatchReceiver};
 
-use crate::{Side, util::dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain}, websockets::{ConnectionRole, MarketEvent}};
+
+use crate::{Side, market_data::{ConnectionRole, MarketEvent, QuantityUpdate}, util::dtos::challenge_orderbook::{SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain}, websockets::ConnectionHealth, };
 
 pub const USDC_DENOMINATION:u64 = 1000000;
+pub const LATENCY_SUPERIORITY_THRESHOLD_PCT: u64 = 10;
 
 pub struct OrderBook {
     pub symbol : String,
@@ -62,7 +66,7 @@ impl OrderBook {
         true
     }
 
-    pub fn apply_delta(&mut self,side : Side,price: u64,size:u64,ex_ts: DateTime<Utc>)->bool {
+    pub fn apply_delta(&mut self,side : Side,price: u64,size:QuantityUpdate,ex_ts: DateTime<Utc>)->bool {
         if !self.initialized {
             return false;
         }
@@ -78,11 +82,31 @@ impl OrderBook {
             Side::Sell => &mut self.asks
         };
 
-        if size == 0 {
-            side.remove(&price);
-        }else {
-            side.insert(price, size);
+        match size {
+            QuantityUpdate::Set(new_size) => {
+                if new_size == 0 {
+                    side.remove(&price);
+                }else {
+                    side.insert(price, new_size);
+                }
+            }
+            QuantityUpdate::Change(delta) => {
+                let current_size= side.get(&price).copied().unwrap_or(0);
+                let new_size = (current_size as i64).saturating_sub(delta);
+
+                if new_size <= 0 {
+                    side.remove(&price);
+                }else {
+                    side.insert(price, new_size as u64);
+                }
+            }
         }
+
+        // if size == 0 {
+        //     side.remove(&price);
+        // }else {
+        //     side.insert(price, size);
+        // }
 
         self.last_updated = Some(Utc::now());
         self.exchange_timestamp = Some(ex_ts);
@@ -249,3 +273,56 @@ impl OrderBookManager {
             .collect()
     }
 }
+
+pub struct SourceSelector {
+    pub worker_id: usize,
+    pub active_role: ConnectionRole,
+    pub primary_health: WatchReceiver<ConnectionHealth>,
+    pub secondary_health: WatchReceiver<ConnectionHealth>,
+    pub better_since : Option<Instant>
+}
+
+impl SourceSelector {
+    pub fn new(
+        worker_id: usize,
+        primary_health: WatchReceiver<ConnectionHealth>,
+        secondary_health: WatchReceiver<ConnectionHealth>,
+    ) -> Self {
+        Self {
+            worker_id,
+            active_role: ConnectionRole::Primary,
+            primary_health,
+            secondary_health,
+            better_since:None
+        }
+    }
+    pub fn check_failover(&mut self) -> Option<ConnectionRole> {
+        let p_ok = *self.primary_health.borrow() == ConnectionHealth::Connected;
+        let s_ok = *self.secondary_health.borrow() == ConnectionHealth::Connected;
+        if self.active_role == ConnectionRole::Primary && !p_ok && s_ok {
+            self.active_role = ConnectionRole::Secondary;
+            Some(ConnectionRole::Secondary)
+        } else if self.active_role == ConnectionRole::Secondary && !s_ok && p_ok {
+            self.active_role = ConnectionRole::Primary;
+            Some(ConnectionRole::Primary)
+        } else {
+            None
+        }
+    }
+
+    pub fn latency_check(&mut self,active_median:u64,candidate_median: u64,now :Instant) -> bool {
+        if active_median == 0 {
+            self.better_since = None;
+            return false;
+        }
+
+        // 10% faster
+        if !(candidate_median.saturating_mul(100) <= active_median.saturating_mul(100 -LATENCY_SUPERIORITY_THRESHOLD_PCT)) {
+            self.better_since = None;
+            return false;
+        }
+        let since = self.better_since.get_or_insert(now);
+        now.duration_since(*since) >= Duration::from_secs(60 * 60)
+    }
+}
+
