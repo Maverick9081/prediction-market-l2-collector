@@ -160,16 +160,16 @@ pub async fn run_worker(
                             });
 
                             if let Err(e) = ws_write.send(Message::Text(sub.to_string().into())).await {
-                                metrics.on_subscribe_failure(tokens.len());
+                                metrics.on_subscribe_failure(chunk.len());
 
                                 error!("[Worker {}] Failed to send dynamic subscribe: {}", worker_id, e);
                                 break;
                             }
+                            metrics.on_subscribe_success(chunk.len());
+
+                            assigned_tokens.extend(chunk.iter().cloned());
                         }
-                        metrics.on_subscribe_success(tokens.len());
-
-                        assigned_tokens.extend(tokens);
-
+                     
                     }
 
                     WorkerCommand::Unsubscribe(tokens) => {
@@ -181,18 +181,22 @@ pub async fn run_worker(
                                 "assets_ids": chunk
                             });
 
-                            debug!("Removing {} token from subscriptions",tokens.len());
+                            debug!("Removing {} token from subscriptions",chunk.len());
 
                             if let Err(e) = ws_write.send(Message::Text(unsub.to_string().into())).await {
-                                metrics.on_unsubscribe_failure(tokens.len());
+                                metrics.on_unsubscribe_failure(chunk.len());
 
                                 error!("[Worker {}] Failed to send dynamic unsubscribe: {}", worker_id, e);
                                 break;
                             }
-                        }
-                        metrics.on_unsubscribe_success(tokens.len());
 
-                        assigned_tokens.retain(|token| !tokens.contains(token));
+                            metrics.on_unsubscribe_success(chunk.len());
+
+                            for t in chunk {
+                                assigned_tokens.remove(t);
+                            }
+                        }
+                       
                     }
 
                     WorkerCommand::Shutdown => {

@@ -92,7 +92,7 @@ impl OrderBook {
             }
             QuantityUpdate::Change(delta) => {
                 let current_size= side.get(&price).copied().unwrap_or(0);
-                let new_size = (current_size as i64).saturating_sub(delta);
+                let new_size = (current_size as i64).saturating_add(delta);
 
                 if new_size <= 0 {
                     side.remove(&price);
@@ -296,20 +296,7 @@ impl SourceSelector {
             better_since:None
         }
     }
-    pub fn check_failover(&mut self) -> Option<ConnectionRole> {
-        let p_ok = *self.primary_health.borrow() == ConnectionHealth::Connected;
-        let s_ok = *self.secondary_health.borrow() == ConnectionHealth::Connected;
-        if self.active_role == ConnectionRole::Primary && !p_ok && s_ok {
-            self.active_role = ConnectionRole::Secondary;
-            Some(ConnectionRole::Secondary)
-        } else if self.active_role == ConnectionRole::Secondary && !s_ok && p_ok {
-            self.active_role = ConnectionRole::Primary;
-            Some(ConnectionRole::Primary)
-        } else {
-            None
-        }
-    }
-
+   
     pub fn latency_check(&mut self,active_median:u64,candidate_median: u64,now :Instant) -> bool {
         if active_median == 0 {
             self.better_since = None;

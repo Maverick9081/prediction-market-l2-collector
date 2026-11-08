@@ -1,6 +1,6 @@
 use std::{collections::HashSet, str::FromStr};
 
-use anyhow::{Error, Result, anyhow};
+use anyhow::{Error, Result};
 use chrono::{DateTime, Utc};
 use log::{error, warn};
 use reqwest::Client;
@@ -209,7 +209,7 @@ impl PolyMarketDiscovery {
 
 impl MarketDiscovery for PolyMarketDiscovery {
     async fn discover_active(&self) -> anyhow::Result<HashSet<String>> {
-        fetch_active(&self.client).await.map_err(|e| anyhow!(e))
+        fetch_active(&self.client).await
     }
 }
 
@@ -242,7 +242,7 @@ pub async fn fetch_active(client:&Client) -> Result<HashSet<String>,Error> {
             Some(c) if !c.is_empty() && c != "LTE=" => {
                 if !seen_cursors.insert(c.clone()) {
                     error!("Pagination cursor repeated: {}", c);
-                    break;
+                    return Err(anyhow::anyhow!("Pagination cursor repeated: {}", c));
                 }
         
                 cursor = c;

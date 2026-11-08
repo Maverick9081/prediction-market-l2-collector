@@ -1,7 +1,7 @@
 use std::{error::Error, sync::atomic::Ordering, time::Duration};
 
 use chrono::Utc;
-use log::{error, warn};
+use log::{error, info, warn};
 use tokio::{
     signal::ctrl_c,
     sync::{
@@ -197,7 +197,42 @@ pub async fn run<P:FeedPool>(
 
             _ = ctrl_c() => {
 
-                    ws_pool.shutdown().await;
+                    let mut shutdown_fut = Box::pin(ws_pool.shutdown());
+
+                    loop {
+                        tokio::select! {
+
+                            _ = &mut shutdown_fut => {
+                                info!("All WebSocket workers shut down cleanly.");
+                                break;
+                            }
+
+                            Some(ws_msg) = event_rx.recv() => {
+                                let WsEvent { worker_id, role, event, received_at: _ } = ws_msg;
+                                let applied = order_book_manager.apply_event(role, &event);
+                                if applied && role == source_selectors[worker_id].active_role {
+                                    if let MarketEvent::Delta(delta) = event {
+                                        if let Ok(p) = i64::try_from(delta.price) {
+                                            let s = match delta.size {
+                                                QuantityUpdate::Set(s) => s as i64,
+                                                QuantityUpdate::Change(c) => c,
+                                            };                                
+                                            let _ = writer_tx.send(WriterCommand::Delta(PriceLevelUpdateDomain {
+                                                backtest_timestamp: Utc::now(),
+                                                exchange_timestamp: delta.exchange_timestamp,
+                                                price_level: p,
+                                                quantity: s,
+                                                side: delta.side,
+                                                symbol: delta.asset_id,
+                                            })).await;
+                                        }
+                                    }
+                                }
+                            }
+
+                        }
+
+                    }
 
                     while let Ok(ws_msg) = event_rx.try_recv() {
                         let WsEvent { worker_id, role, event,received_at } = ws_msg;
@@ -227,8 +262,8 @@ pub async fn run<P:FeedPool>(
 
                     if let Err(e) = writer_tx.send(WriterCommand::Flush(done_tx)).await {
                         error!("Failed to send flush to writer: {}", e);
-                    } else {
-                        let _ = done_rx.await;
+                    } else if let Err(e) = done_rx.await {
+                        error!("Writer dropped flush confirmation: {}", e);
                     }
                     break;
                 }

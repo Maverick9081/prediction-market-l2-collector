@@ -1,10 +1,8 @@
 use std::{collections::HashSet, time::Duration};
-use anyhow::anyhow;
 use log::{error, info};
-use reqwest::{Client};
 use tokio::{sync::mpsc::Sender, time::interval};
 
-use crate::{polymarket::fetch_active, traits::MarketDiscovery};
+use crate::{ traits::MarketDiscovery};
 
 
 #[derive(Debug, Clone)]
